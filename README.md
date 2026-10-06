@@ -15,6 +15,7 @@ Give it a list of seed usernames. It will:
 2. **Check every seed + variant against ~45 known platforms** (GitHub, Reddit, Instagram, TikTok, Twitch, Steam, Telegram, Mastodon, and more) concurrently, with per-site true/false-positive logic — including a filter for Cloudflare/bot-challenge interstitials that would otherwise masquerade as false "found" hits.
 3. **Pull a content snippet off every hit** (page title + meta description/bio) and **correlate accounts** across different seeds and sites using both username-string similarity and shared bio/title language — surfacing candidate links between accounts for you to review and confirm manually, last, not first.
 4. **Optionally merge in [Sherlock](https://github.com/sherlock-project/sherlock)** results if it's installed locally, for broader site coverage beyond the built-in list.
+5. **Tune accuracy to taste** — retry flaky checks, filter out soft-404s, tighten correlation to require multiple signals, or scope which sites get queried at all.
 
 Output is a JSON report (full detail, including correlation groups) and a flat CSV (for quick triage in a spreadsheet).
 
@@ -46,6 +47,8 @@ $ python3 userhunter.py -i seeds.txt -o case001
 
 The banner above prints on every run — there's no flag to suppress it.
 
+**Results are saved as they're found, not just at the end.** Every hit is written immediately to `<output>.csv` and a `<output>.partial.json` snapshot — so a scan that gets interrupted, killed, or crashes partway through still leaves everything found up to that point safely on disk. On a clean finish, the partial file is replaced by the final `<output>.json` (which adds correlation on top).
+
 ## Install
 
 ```bash
@@ -62,6 +65,8 @@ python3 userhunter.py -i seeds.txt -o case001
 
 `seeds.txt` — one seed username per line. Blank lines and lines starting with `#` are ignored.
 
+**Core**
+
 | Flag | Default | Description |
 |---|---|---|
 | `-i, --input` | *required* | Seed username list (text file) |
@@ -69,10 +74,39 @@ python3 userhunter.py -i seeds.txt -o case001
 | `--max-variants` | `150` | Max variants generated per seed |
 | `--threads` | `30` | Concurrent HTTP workers |
 | `--timeout` | `8` | Per-request timeout (seconds) |
+| `-v, --verbose` | off | Verbose logging + periodic progress updates |
+
+**Accuracy & reliability** — reduce false negatives/positives
+
+| Flag | Default | Description |
+|---|---|---|
+| `--retries N` | `0` | Retry a check N times on timeout/connection failure before giving up. A single dropped connection no longer means a permanent miss. |
+| `--min-title-length N` | `0` (off) | Discard a hit if its extracted page title is shorter than N characters — filters soft-404s (a page that returns 200 with no real profile content behind it). Only takes effect when profile fetching is on. |
 | `--similarity-threshold` | `0.82` | Min ratio (0–1) for flagging username correlation |
-| `--use-sherlock` | off | Also run Sherlock (if installed) for extra site coverage |
-| `--no-profile-fetch` | off | Skip fetching title/bio snippets (faster, less correlation signal) |
-| `-v, --verbose` | off | Verbose logging |
+| `--require-signal {1,2}` | `1` | `1` flags a correlation if either signal (username similarity *or* bio/title overlap) fires. `2` requires both — fewer but stronger leads. |
+
+**Site control & coverage**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--use-sherlock` | off | Also run Sherlock (if installed) for extra site coverage, one seed at a time |
+| `--exclude-sites a,b,c` | none | Comma-separated site names to skip (e.g. `Kik,VK,Ask.fm`) |
+| `--sites-file FILE` | none | JSON file of additional/override site definitions — see format below |
+| `--no-case-variants` | off | Skip case-mangled variants (`TiAn`, `TIAN`...) — frees variant budget for leet/delimiter/affix combos instead, useful since many platforms are case-insensitive on lookup anyway |
+| `--no-profile-fetch` | off | Skip fetching title/bio snippets (faster, but weakens correlation and disables `--min-title-length`) |
+
+### `--sites-file` format
+
+Same shape as the built-in list — add new platforms or override an existing entry:
+
+```json
+{
+  "MySite": {"url": "https://mysite.example/{}", "mode": "status_200"},
+  "AnotherSite": {"url": "https://another.example/u/{}", "mode": "status_200_not_text", "error_text": "User not found"}
+}
+```
+
+`mode` is either `status_200` (any HTTP 200 counts as a hit) or `status_200_not_text` (HTTP 200 *and* `error_text` absent from the page — use this whenever the site returns 200 for both real and missing profiles, which is common).
 
 ### Examples
 
@@ -80,8 +114,11 @@ python3 userhunter.py -i seeds.txt -o case001
 # Wider net: more variants, more threads
 python3 userhunter.py -i seeds.txt -o case001 --max-variants 250 --threads 40 -v
 
-# Merge in Sherlock's broader site list
-python3 userhunter.py -i seeds.txt -o case001 --use-sherlock
+# Higher-confidence run: retry flaky checks, filter soft-404s, require both correlation signals
+python3 userhunter.py -i seeds.txt -o case001 --retries 2 --min-title-length 5 --require-signal 2
+
+# Merge in Sherlock, skip a couple of noisy/irrelevant sites
+python3 userhunter.py -i seeds.txt -o case001 --use-sherlock --exclude-sites "Kik,VK"
 
 # Fast pass, no content fetch
 python3 userhunter.py -i seeds.txt -o case001 --no-profile-fetch
