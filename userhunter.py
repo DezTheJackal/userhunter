@@ -45,6 +45,7 @@ import shutil
 import string
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -279,13 +280,17 @@ def structural_variants(word: str) -> set:
     return out
 
 
-def generate_variants(seed: str, max_variants: int = 150) -> list:
+def generate_variants(seed: str, max_variants: int = 150, no_case_variants: bool = False) -> list:
     """Compose all technique layers, dedupe, cap at max_variants.
     Always attempts to exceed 100 unless the combinatorics genuinely run out
-    for a very short seed."""
+    for a very short seed. --no-case-variants drops the case-mangling layer:
+    many platforms are case-insensitive on lookup, so those checks are often
+    duplicates of the same account — skipping them frees up variant budget
+    for leet/delimiter/affix combinations instead."""
     pool = {seed}
     pool |= leet_variants(seed)
-    pool |= case_variants(seed)
+    if not no_case_variants:
+        pool |= case_variants(seed)
     pool |= delimiter_variants(seed)
     pool |= affix_variants(seed)
     pool |= structural_variants(seed)
@@ -295,7 +300,8 @@ def generate_variants(seed: str, max_variants: int = 150) -> list:
     for lv in base_leet:
         pool |= delimiter_variants(lv)
         pool |= affix_variants(lv)
-        pool |= case_variants(lv)
+        if not no_case_variants:
+            pool |= case_variants(lv)
 
     pool.discard("")
     pool.discard(seed)
@@ -309,16 +315,39 @@ def generate_variants(seed: str, max_variants: int = 150) -> list:
 # --------------------------------------------------------------------------
 # Account checking
 # --------------------------------------------------------------------------
+CONNECT_TIMEOUT_CAP = 5  # don't burn the full --timeout waiting on a TCP handshake that isn't coming.
+                          # This only affects how long we wait to *establish* a connection — it
+                          # never touches how much of the body gets read, so it can't affect
+                          # detection accuracy. (A body-size cap was tried and reverted: some
+                          # sites inject large JS/JSON blobs before the actual not-found marker
+                          # text, so truncating risked silently missing that marker on a few
+                          # sites and misreading a real 404 as a hit. Not worth the risk — every
+                          # check always reads the full page, same as before.)
+
+
 def check_one(session: requests.Session, seed: str, variant: str, site: str,
-              cfg: dict, timeout: int, fetch_profile: bool) -> Optional[Hit]:
+              cfg: dict, timeout: int, fetch_profile: bool,
+              retries: int = 0, min_title_length: int = 0) -> Optional[Hit]:
     url = cfg["url"].format(variant)
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-    except requests.RequestException as e:
-        log.debug("Request failed for %s: %s", url, e)
+    connect_timeout = min(CONNECT_TIMEOUT_CAP, timeout)
+
+    resp = None
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            resp = session.get(url, headers=HEADERS, timeout=(connect_timeout, timeout), allow_redirects=True)
+            break
+        except requests.RequestException as e:
+            last_err = e
+            if attempt < retries:
+                log.debug("Retry %d/%d for %s after: %s", attempt + 1, retries, url, e)
+                time.sleep(0.5 * (attempt + 1))  # small backoff, not a full retry-storm
+    if resp is None:
+        log.debug("Request failed for %s after %d attempt(s): %s", url, retries + 1, last_err)
         return None
 
-    body_lower = resp.text.lower()
+    body_text = resp.text
+    body_lower = body_text.lower()
 
     # Bot-protection interstitials masquerade as 200 OK with no real profile
     # content behind them — never count these as a hit either way.
@@ -336,9 +365,10 @@ def check_one(session: requests.Session, seed: str, variant: str, site: str,
         return None
 
     snippet = ""
+    title = ""
     if fetch_profile and HAVE_BS4:
         try:
-            soup = BeautifulSoup(resp.text, "html.parser")
+            soup = BeautifulSoup(body_text, "html.parser")
             title = soup.title.string.strip() if soup.title and soup.title.string else ""
             desc_tag = soup.find("meta", attrs={"name": "description"}) or \
                        soup.find("meta", attrs={"property": "og:description"})
@@ -347,24 +377,111 @@ def check_one(session: requests.Session, seed: str, variant: str, site: str,
         except Exception as e:
             log.debug("Profile parse failed for %s: %s", url, e)
 
+    # A "found" page with a suspiciously short/empty title is often a soft-404:
+    # passed the status/error-text check but has no real profile content behind
+    # it (parked page, template bug, generic placeholder). Only applies when a
+    # title was actually extracted (fetch_profile on, bs4 available) — with
+    # those off, there's no title to measure, so the filter can't apply.
+    if min_title_length > 0 and fetch_profile and HAVE_BS4 and len(title) < min_title_length:
+        log.debug("Discarded %s as likely soft-404 (title %d chars, min %d): %r",
+                   url, len(title), min_title_length, title)
+        return None
+
     return Hit(seed=seed, variant=variant, site=site, url=url, status="found", title_snippet=snippet)
 
 
+def build_site_list(exclude: Optional[str], sites_file: Optional[str]) -> dict:
+    """Start from the built-in SITES, drop anything in --exclude-sites,
+    then merge in anything from --sites-file (same {name: {url, mode, ...}}
+    shape; a name already in SITES gets overridden by the file's version)."""
+    sites = dict(SITES)
+
+    if exclude:
+        names = {n.strip() for n in exclude.split(",") if n.strip()}
+        lower_to_real = {k.lower(): k for k in sites}
+        unknown = []
+        for name in names:
+            real = lower_to_real.get(name.lower())
+            if real:
+                del sites[real]
+            else:
+                unknown.append(name)
+        if unknown:
+            log.warning("--exclude-sites: no match for %s (check spelling against the built-in site names)",
+                        ", ".join(unknown))
+
+    if sites_file:
+        try:
+            extra = json.loads(Path(sites_file).read_text(encoding="utf-8"))
+        except Exception as e:
+            log.error("Could not read --sites-file %s: %s", sites_file, e)
+            sys.exit(1)
+        added, skipped = 0, []
+        for name, cfg in extra.items():
+            if not isinstance(cfg, dict) or "url" not in cfg or "mode" not in cfg:
+                skipped.append(name)
+                continue
+            if cfg["mode"] not in ("status_200", "status_200_not_text"):
+                skipped.append(name)
+                continue
+            if cfg["mode"] == "status_200_not_text" and "error_text" not in cfg:
+                skipped.append(name)
+                continue
+            sites[name] = cfg
+            added += 1
+        log.info("--sites-file: added/overrode %d site(s) from %s", added, sites_file)
+        if skipped:
+            log.warning("--sites-file: skipped malformed entries: %s", ", ".join(skipped))
+
+    return sites
+
+
+class LiveWriter:
+    """Persists hits to disk as they're found, not just at the end.
+    A long scan can run for hours; if it's killed or crashes partway
+    through, everything found so far is still on disk — CSV rows are
+    appended immediately, and a partial JSON snapshot is rewritten after
+    each hit (marked "partial": true, no correlation yet — correlation
+    needs the complete hit set and only runs once the scan finishes)."""
+
+    def __init__(self, output_prefix: str, seeds: list):
+        self.csv_path = f"{output_prefix}.csv"
+        self.partial_json_path = f"{output_prefix}.partial.json"
+        self.seeds = seeds
+        self.lock = threading.Lock()
+        self.hits: list = []
+        with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(["seed", "variant", "site", "url", "status", "title_snippet"])
+
+    def add(self, hit: "Hit"):
+        with self.lock:
+            self.hits.append(hit)
+            with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([hit.seed, hit.variant, hit.site, hit.url, hit.status, hit.title_snippet])
+            Path(self.partial_json_path).write_text(
+                json.dumps({"partial": True, "seeds": self.seeds, "hits": [asdict(h) for h in self.hits]}, indent=2),
+                encoding="utf-8",
+            )
+
+
 def run_checks(seed_variant_pairs: list, threads: int, timeout: int,
-               fetch_profile: bool, verbose: bool) -> list:
+               fetch_profile: bool, verbose: bool, live: Optional[LiveWriter] = None,
+               sites: Optional[dict] = None, retries: int = 0, min_title_length: int = 0) -> list:
+    sites = sites if sites is not None else SITES
     hits = []
     session = requests.Session()
     jobs = [(seed, variant, site, cfg)
             for seed, variant in seed_variant_pairs
-            for site, cfg in SITES.items()]
+            for site, cfg in sites.items()]
     total = len(jobs)
     log.info("Dispatching %d checks across %d sites (%d threads)...",
-              total, len(SITES), threads)
+              total, len(sites), threads)
 
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         futures = {
-            pool.submit(check_one, session, seed, variant, site, cfg, timeout, fetch_profile): (seed, variant, site)
+            pool.submit(check_one, session, seed, variant, site, cfg, timeout, fetch_profile,
+                        retries, min_title_length): (seed, variant, site)
             for seed, variant, site, cfg in jobs
         }
         for fut in concurrent.futures.as_completed(futures):
@@ -374,6 +491,8 @@ def run_checks(seed_variant_pairs: list, threads: int, timeout: int,
             result = fut.result()
             if result:
                 hits.append(result)
+                if live:
+                    live.add(result)
                 log.info("[FOUND] %-14s %-25s -> %s", result.site, result.variant, result.url)
     return hits
 
@@ -409,11 +528,13 @@ def run_sherlock(seed: str, timeout: int) -> list:
 # --------------------------------------------------------------------------
 # Correlation
 # --------------------------------------------------------------------------
-def correlate(hits: list, similarity_threshold: float) -> list:
+def correlate(hits: list, similarity_threshold: float, require_signals: int = 1) -> list:
     """Group hits into likely-same-identity clusters using two signals:
       1. Username text similarity across different seeds (catches a suspect
          reusing a near-identical handle across platforms/seed lists).
       2. Overlapping meaningful words in fetched title/bio snippets.
+    require_signals=1 (default) flags a pair if either signal fires.
+    require_signals=2 only flags a pair where BOTH agree — fewer, stronger leads.
     Output groups are suggestions for investigator review, not conclusions.
     """
     groups = []
@@ -451,7 +572,7 @@ def correlate(hits: list, similarity_threshold: float) -> list:
             reasons.append(f"shared bio/title terms: {', '.join(list(overlap)[:5])}")
             score = max(score, 0.5 + 0.1 * len(overlap))
 
-        if reasons:
+        if len(reasons) >= require_signals:
             used_pairs.add(key)
             groups.append(CorrelationGroup(
                 accounts=[f"{h1.site}:{h1.url}", f"{h2.site}:{h2.url}"],
@@ -522,6 +643,12 @@ def main():
     parser.add_argument("--similarity-threshold", type=float, default=0.82, help="Min ratio (0-1) for username correlation (default 0.82)")
     parser.add_argument("--use-sherlock", action="store_true", help="Also run Sherlock (if installed) on each seed for extra site coverage")
     parser.add_argument("--no-profile-fetch", action="store_true", help="Skip fetching title/bio snippets (faster, less correlation signal)")
+    parser.add_argument("--retries", type=int, default=0, help="Retry a check this many times on timeout/connection failure before giving up (default 0)")
+    parser.add_argument("--min-title-length", type=int, default=0, help="Discard a hit if its extracted title is shorter than this — filters soft-404s (default 0, off)")
+    parser.add_argument("--exclude-sites", help="Comma-separated site names to skip, e.g. 'Kik,VK,Ask.fm'")
+    parser.add_argument("--sites-file", help="JSON file of additional/override site definitions, same shape as the built-in list")
+    parser.add_argument("--no-case-variants", action="store_true", help="Skip case-mangled variants (TiAn, TIAN, ...) — frees variant budget for other techniques")
+    parser.add_argument("--require-signal", type=int, choices=[1, 2], default=1, help="1 = flag a correlation if either signal fires (default). 2 = require both (fewer, stronger leads)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     args = parser.parse_args()
 
@@ -532,6 +659,12 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    # -v is meant to show userhunter's own progress, not every HTTP library
+    # internal (connection setup, raw request/response lines). Keep those
+    # libraries quiet regardless of verbosity so -v output stays readable.
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("charset_normalizer").setLevel(logging.WARNING)
 
     if not HAVE_BS4 and not args.no_profile_fetch:
         log.warning("beautifulsoup4 not installed — profile snippets disabled. "
@@ -540,14 +673,21 @@ def main():
     seeds = load_seeds(args.input)
     log.info("Loaded %d seed username(s): %s", len(seeds), ", ".join(seeds))
 
+    sites = build_site_list(args.exclude_sites, args.sites_file)
+
     variant_map = {}
     seed_variant_pairs = []
     for seed in seeds:
-        variants = generate_variants(seed, max_variants=args.max_variants)
+        variants = generate_variants(seed, max_variants=args.max_variants, no_case_variants=args.no_case_variants)
         variant_map[seed] = variants
         log.info("Seed '%s': %d variants generated", seed, len(variants))
         for v in variants:
             seed_variant_pairs.append((seed, v))
+
+    live = LiveWriter(args.output, seeds)
+    log.info("Live results will be written to %s and %s as they're found "
+              "(safe to interrupt — nothing found so far will be lost).",
+              live.csv_path, live.partial_json_path)
 
     start = time.time()
     hits = run_checks(
@@ -556,21 +696,31 @@ def main():
         timeout=args.timeout,
         fetch_profile=(not args.no_profile_fetch) and HAVE_BS4,
         verbose=args.verbose,
+        live=live,
+        sites=sites,
+        retries=args.retries,
+        min_title_length=args.min_title_length,
     )
 
     if args.use_sherlock:
         for seed in seeds:
-            hits.extend(run_sherlock(seed, timeout=args.timeout))
+            sherlock_hits = run_sherlock(seed, timeout=args.timeout)
+            for h in sherlock_hits:
+                live.add(h)
+            hits.extend(sherlock_hits)
 
     elapsed = time.time() - start
     log.info("Scan complete in %.1fs — %d account(s) found across %d checks",
-              elapsed, len(hits), len(seed_variant_pairs) * len(SITES))
+              elapsed, len(hits), len(seed_variant_pairs) * len(sites))
 
-    groups = correlate(hits, similarity_threshold=args.similarity_threshold)
+    groups = correlate(hits, similarity_threshold=args.similarity_threshold, require_signals=args.require_signal)
     log.info("Correlation: %d candidate link(s) flagged for review", len(groups))
 
     json_path, csv_path = write_reports(args.output, hits, groups, seeds, variant_map)
     log.info("Reports written: %s, %s", json_path, csv_path)
+
+    # scan finished cleanly — the partial snapshot is superseded by the final report
+    Path(live.partial_json_path).unlink(missing_ok=True)
 
     if not hits:
         log.warning("No accounts found. Check network access or widen --max-variants.")
