@@ -337,13 +337,21 @@ def check_one(session: requests.Session, seed: str, variant: str, site: str,
         try:
             resp = session.get(url, headers=HEADERS, timeout=(connect_timeout, timeout), allow_redirects=True)
             break
-        except requests.RequestException as e:
+        except Exception as e:
+            # Deliberately broad: a malformed variant plugged into a URL template
+            # (e.g. a trailing "." landing in a subdomain slot, producing an
+            # invalid double-dot hostname) raises urllib3's LocationParseError
+            # here — not a requests.RequestException — before any network call
+            # is even attempted. One bad variant must never be allowed to take
+            # down a multi-hour unattended scan; treat any failure here the
+            # same way: log it, skip this one check, move on.
             last_err = e
             if attempt < retries:
-                log.debug("Retry %d/%d for %s after: %s", attempt + 1, retries, url, e)
+                log.debug("Retry %d/%d for %s after: %s: %s", attempt + 1, retries, url, type(e).__name__, e)
                 time.sleep(0.5 * (attempt + 1))  # small backoff, not a full retry-storm
     if resp is None:
-        log.debug("Request failed for %s after %d attempt(s): %s", url, retries + 1, last_err)
+        log.debug("Request failed for %s after %d attempt(s): %s: %s",
+                   url, retries + 1, type(last_err).__name__, last_err)
         return None
 
     body_text = resp.text
@@ -488,7 +496,16 @@ def run_checks(seed_variant_pairs: list, threads: int, timeout: int,
             done += 1
             if verbose and done % 200 == 0:
                 log.info("Progress: %d/%d checks complete", done, total)
-            result = fut.result()
+            try:
+                result = fut.result()
+            except Exception as e:
+                # Belt-and-suspenders: check_one already catches everything it can,
+                # but a scan that's going to run for hours unattended must never
+                # die from one unanticipated error in a single check. Log it,
+                # skip that one check, keep going.
+                seed, variant, site = futures[fut]
+                log.debug("Unexpected error on %s/%s @ %s: %s: %s", seed, variant, site, type(e).__name__, e)
+                continue
             if result:
                 hits.append(result)
                 if live:
